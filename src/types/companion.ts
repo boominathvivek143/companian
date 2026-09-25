@@ -6,6 +6,7 @@ export interface AppPreferences {
   fontSize: number; // 12px to 32px
   theme: 'light' | 'dark';
   autoScroll: boolean;
+  alwaysOnTop?: boolean;
 }
 
 export interface WsMessagePayload {
@@ -40,9 +41,11 @@ export interface CompanionIPCBridge {
     statusText: ConnectionState;
     port: number;
     sessionToken: string;
+    addresses: string[];
   }>;
   clearText: () => Promise<void>;
   copyText: (text: string) => Promise<boolean>;
+  sendReply: (text: string) => Promise<boolean>;
   getSessionToken: () => Promise<string>;
   regenerateSessionToken: () => Promise<string>;
   savePreferences: (prefs: Partial<AppPreferences>) => Promise<void>;
@@ -51,12 +54,14 @@ export interface CompanionIPCBridge {
   maximize: () => void;
   close: () => void;
   onTextUpdate: (callback: (data: { text: string; timestamp: number }) => void) => () => void;
+  onImagesUpdate: (callback: (data: { images: string[] }) => void) => () => void;
   onConnectionChange: (
     callback: (status: {
       connected: boolean;
       statusText: ConnectionState;
       port: number;
       sessionToken: string;
+      addresses: string[];
     }) => void
   ) => () => void;
 }

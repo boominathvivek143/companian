@@ -1,20 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { ConnectionState, AppPreferences, WsMessagePayload } from '../types/companion';
+import { ConnectionState, AppPreferences } from '../types/companion';
 import { ConnectionStatus } from '../components/ConnectionStatus';
 import { Toolbar } from '../components/Toolbar';
 import { TextViewer } from '../components/TextViewer';
 import { SecurityModal } from '../components/SecurityModal';
-import { Minus, Square, X, Settings, Shield, Sparkles } from 'lucide-react';
+import { Minus, Square, X, Settings, Shield, Sparkles, Pin, PinOff } from 'lucide-react';
 
-interface CompanionAppProps {
-  isEmbeddedWindow?: boolean; // When rendered inside the split desktop frame
-  onCloseSimulated?: () => void;
-}
-
-export const CompanionApp: React.FC<CompanionAppProps> = ({
-  isEmbeddedWindow = false,
-  onCloseSimulated,
-}) => {
+// Companion window UI, rendered inside Electron (receives text and images over IPC)
+export const CompanionApp: React.FC = () => {
   const [text, setText] = useState<string>('');
   const [connectionStatus, setConnectionStatus] = useState<ConnectionState>('Connecting...');
   const [senderActive, setSenderActive] = useState<boolean>(false);
@@ -22,6 +15,11 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
   const [copied, setCopied] = useState<boolean>(false);
   const [isSecurityModalOpen, setIsSecurityModalOpen] = useState<boolean>(false);
   const [port, setPort] = useState<number>(8765);
+  const [addresses, setAddresses] = useState<string[]>([]);
+  const [images, setImages] = useState<string[]>([]);
+  // Reply box: text shown on the connected web sender page
+  const [reply, setReply] = useState<string>('');
+  const replyTimerRef = useRef<any>(null);
 
   // Persistent preferences (theme, fontSize, autoScroll) - NEVER persists text per spec #13 & #15
   const [preferences, setPreferences] = useState<AppPreferences>(() => {
@@ -47,9 +45,6 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
     };
   });
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<any>(null);
-
   // Save UI preferences to localStorage & Electron IPC if available
   const updatePreferences = useCallback((newPrefs: Partial<AppPreferences>) => {
     setPreferences((prev) => {
@@ -64,22 +59,8 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
     });
   }, []);
 
-  // Fetch token from server if running in web preview
-  const fetchSessionToken = async () => {
-    try {
-      const res = await fetch('/api/session-token');
-      if (res.ok) {
-        const data = await res.json();
-        setSessionToken(data.token);
-      }
-    } catch (e) {
-      console.warn('Could not fetch token from REST endpoint:', e);
-    }
-  };
-
-  // Setup communication (Native Electron IPC OR Web WebSocket)
+  // Receive text, images and connection status from the Electron main process
   useEffect(() => {
-    // Mode 1: Real Electron Environment with IPC
     if (window.companion) {
       // Load stored preferences from Electron
       window.companion.loadPreferences().then((prefs) => {
@@ -95,11 +76,16 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
         setText(data.text);
       });
 
+      const unsubscribeImages = window.companion.onImagesUpdate((data) => {
+        setImages(data.images || []);
+      });
+
       // Subscribe to connection status
       const unsubscribeConn = window.companion.onConnectionChange((status) => {
         setConnectionStatus(status.statusText);
         setSenderActive(status.connected);
         setPort(status.port || 8765);
+        setAddresses(status.addresses || []);
         if (status.sessionToken) setSessionToken(status.sessionToken);
       });
 
@@ -107,72 +93,15 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
         setConnectionStatus(status.statusText);
         setSenderActive(status.connected);
         setPort(status.port || 8765);
+        setAddresses(status.addresses || []);
       });
 
       return () => {
         unsubscribeText();
+        unsubscribeImages();
         unsubscribeConn();
       };
     }
-
-    // Mode 2: Web Preview / Simulator Environment using WebSocket
-    fetchSessionToken();
-
-    const connectWebSocket = () => {
-      setConnectionStatus('Connecting...');
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws?role=companion`;
-
-      try {
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          setConnectionStatus('Connected');
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const data: WsMessagePayload = JSON.parse(event.data);
-            if (data.type === 'TEXT_UPDATE' && typeof data.text === 'string') {
-              setText(data.text);
-            } else if (data.type === 'SENDER_STATUS') {
-              setSenderActive(!!data.connected);
-            } else if (data.type === 'TOKEN_REFRESHED') {
-              fetchSessionToken();
-            }
-          } catch (err) {
-            console.error('Failed to parse WebSocket message:', err);
-          }
-        };
-
-        ws.onclose = () => {
-          setConnectionStatus('Disconnected');
-          setSenderActive(false);
-          // Auto-reconnect
-          reconnectTimeoutRef.current = setTimeout(connectWebSocket, 2000);
-        };
-
-        ws.onerror = (err) => {
-          console.error('Companion WebSocket error:', err);
-          setConnectionStatus('Disconnected');
-        };
-      } catch (err) {
-        console.error('WebSocket connection failure:', err);
-        setConnectionStatus('Disconnected');
-      }
-    };
-
-    connectWebSocket();
-
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
-    };
   }, [updatePreferences]);
 
   // Action: Copy text
@@ -199,12 +128,9 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
   // Action: Clear text
   const handleClear = () => {
     setText('');
+    setImages([]);
     if (window.companion?.clearText) {
       window.companion.clearText();
-    }
-    // Also notify if in web mode
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'TEXT_UPDATE', text: '' }));
     }
   };
 
@@ -212,17 +138,15 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
     if (window.companion?.regenerateSessionToken) {
       const newToken = await window.companion.regenerateSessionToken();
       setSessionToken(newToken);
-    } else {
-      try {
-        const res = await fetch('/api/session-token/regenerate', { method: 'POST' });
-        if (res.ok) {
-          const data = await res.json();
-          setSessionToken(data.token);
-        }
-      } catch (e) {
-        console.error('Failed to regenerate token:', e);
-      }
     }
+  };
+
+  const updateReply = (value: string, immediate = false) => {
+    setReply(value);
+    if (replyTimerRef.current) clearTimeout(replyTimerRef.current);
+    const send = () => window.companion?.sendReply(value);
+    if (immediate) send();
+    else replyTimerRef.current = setTimeout(send, 150);
   };
 
   const charCount = text.length;
@@ -233,7 +157,7 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
     <div
       className={`flex flex-col h-full w-full select-none transition-colors duration-200 overflow-hidden ${
         isDark ? 'bg-neutral-950 text-neutral-100' : 'bg-neutral-50 text-neutral-900'
-      } ${!isEmbeddedWindow ? 'border border-neutral-800 rounded-lg shadow-xl' : ''}`}
+      } border border-neutral-800 rounded-lg shadow-xl`}
     >
       {/* Title Bar / Window Header */}
       <header
@@ -248,7 +172,7 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
           {/* OS Window Traffic Lights for desktop aesthetic */}
           <div className="flex items-center gap-1.5">
             <span
-              onClick={onCloseSimulated || (() => window.companion?.close())}
+              onClick={() => window.companion?.close()}
               className="w-3 h-3 rounded-full bg-rose-500/80 hover:bg-rose-500 cursor-pointer transition-colors shadow-xs"
               title="Close window"
             />
@@ -274,14 +198,21 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
             status={connectionStatus}
             senderActive={senderActive}
             theme={preferences.theme}
-            onReconnect={() => {
-              if (wsRef.current) wsRef.current.close();
-            }}
           />
         </div>
 
-        {/* Right: Security & Settings */}
+        {/* Right: Pin on top, Security & Settings */}
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => updatePreferences({ alwaysOnTop: !preferences.alwaysOnTop })}
+            className={`p-1 rounded transition-colors ${
+              preferences.alwaysOnTop ? 'text-indigo-400' : 'text-neutral-400 hover:text-white'
+            } ${isDark ? 'hover:bg-neutral-800' : 'hover:bg-neutral-200'}`}
+            title={preferences.alwaysOnTop ? 'Unpin (stop keeping on top)' : 'Pin (keep above other windows)'}
+            aria-pressed={!!preferences.alwaysOnTop}
+          >
+            {preferences.alwaysOnTop ? <Pin className="w-3.5 h-3.5" /> : <PinOff className="w-3.5 h-3.5" />}
+          </button>
           <button
             onClick={() => setIsSecurityModalOpen(true)}
             className={`p-1 rounded text-neutral-400 hover:text-white transition-colors ${
@@ -310,7 +241,27 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
         wordCount={wordCount}
       />
 
-      {/* Text Viewer Content Area */}
+      {/* Pasted images from the sender */}
+      {images.length > 0 && (
+        <div
+          className={`flex flex-col gap-3 p-4 overflow-y-auto ${text ? 'max-h-[55%] shrink-0 border-b' : 'flex-1'} ${
+            isDark ? 'border-neutral-800' : 'border-neutral-200'
+          }`}
+        >
+          {images.map((src, index) => (
+            <img
+              key={index}
+              src={src}
+              alt={`Pasted image ${index + 1}`}
+              className="max-w-full h-auto rounded-md border border-neutral-800 self-start"
+              draggable={false}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Text Viewer Content Area (hidden when only images were sent, to skip the empty state) */}
+      {(text || images.length === 0) && (
       <TextViewer
         text={text}
         fontSize={preferences.fontSize}
@@ -319,6 +270,32 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
         onClear={handleClear}
         onCopy={handleCopy}
       />
+      )}
+
+      {/* Reply box: shown on the web sender page */}
+      <div
+        className={`shrink-0 border-t p-2 flex flex-col gap-1 ${
+          isDark ? 'border-neutral-800 bg-neutral-900/60' : 'border-neutral-200 bg-neutral-100'
+        }`}
+      >
+        <div className="flex items-center justify-between text-[11px] text-neutral-500 px-0.5">
+          <span>Reply — shown on the web page</span>
+          {reply && (
+            <button onClick={() => updateReply('', true)} className="hover:text-neutral-300">
+              Clear reply
+            </button>
+          )}
+        </div>
+        <textarea
+          value={reply}
+          onChange={(e) => updateReply(e.target.value)}
+          placeholder="Type or paste a reply…"
+          rows={3}
+          className={`w-full resize-none rounded-md border px-2 py-1.5 text-sm select-text focus:outline-none focus:border-indigo-500 ${
+            isDark ? 'bg-neutral-950 border-neutral-800 text-neutral-100' : 'bg-white border-neutral-300 text-neutral-900'
+          }`}
+        />
+      </div>
 
       {/* Security & Token Settings Modal */}
       <SecurityModal
@@ -328,6 +305,7 @@ export const CompanionApp: React.FC<CompanionAppProps> = ({
         onRegenerateToken={handleRegenerateToken}
         theme={preferences.theme}
         port={port}
+        addresses={addresses}
       />
     </div>
   );

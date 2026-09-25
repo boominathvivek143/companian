@@ -8,6 +8,8 @@ interface SecurityModalProps {
   onRegenerateToken: () => void;
   theme: 'light' | 'dark';
   port: number;
+  // Network addresses (host:port) a sender on another machine can use; only known inside Electron
+  addresses?: string[];
 }
 
 export const SecurityModal: React.FC<SecurityModalProps> = ({
@@ -17,6 +19,7 @@ export const SecurityModal: React.FC<SecurityModalProps> = ({
   onRegenerateToken,
   theme,
   port,
+  addresses = [],
 }) => {
   const [copied, setCopied] = useState(false);
   const [showQR, setShowQR] = useState(false);
@@ -58,8 +61,28 @@ export const SecurityModal: React.FC<SecurityModalProps> = ({
 
         <div className="space-y-4 text-xs">
           <p className={isDark ? 'text-neutral-400' : 'text-neutral-600'}>
-            The WebSocket service strictly binds to <code className="font-mono text-indigo-400">127.0.0.1:{port}</code>. Only senders presenting this random token are permitted to transmit text.
+            The WebSocket service listens on port <code className="font-mono text-indigo-400">{port}</code>. Only senders presenting this random token are permitted to transmit text.
           </p>
+
+          {addresses.length > 0 && (
+            <div>
+              <label className="block text-[11px] font-medium text-neutral-400 mb-1">
+                Companion Address (enter on the sender machine)
+              </label>
+              <div className="space-y-1">
+                {addresses.map((address) => (
+                  <div
+                    key={address}
+                    className={`rounded-lg border px-3 py-2 font-mono text-emerald-400 select-all ${
+                      isDark ? 'bg-neutral-950 border-neutral-800' : 'bg-neutral-50 border-neutral-200'
+                    }`}
+                  >
+                    {address}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div>
             <label className="block text-[11px] font-medium text-neutral-400 mb-1">

@@ -7,8 +7,10 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build",
+    "build:electron": "esbuild electron/main.ts --bundle --platform=node --format=esm --packages=external --outfile=electron/out/main.js && esbuild electron/preload.ts --bundle --platform=node --format=cjs --external:electron --outfile=electron/out/preload.js",
     "start": "tsx server.ts",
-    "dev:electron": "electron .",
+    "dev:electron": "npm run build:electron && electron electron/out/main.js",
+    "start:desktop": "npm run build && npm run build:electron && electron electron/out/main.js",
     "package": "electron-builder",
     "package:win": "electron-builder --win nsis",
     "package:mac": "electron-builder --mac dmg",

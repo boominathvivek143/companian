@@ -6,10 +6,14 @@ export interface WebSocketServerOptions {
   port?: number;
   host?: string;
   maxPayload?: number; // 5MB default
+  sessionToken?: string; // Reuse a persisted token; a random one is generated otherwise
   onTextReceived?: (text: string, metadata: { timestamp: number; senderId: string }) => void;
+  onImagesReceived?: (images: string[]) => void;
   onSenderStatusChange?: (connected: boolean, senderInfo?: { id: string }) => void;
   onError?: (err: Error) => void;
 }
+
+const MAX_IMAGES = 10;
 
 export class LocalCompanionWebSocketServer {
   private wss: WebSocketServer | null = null;
@@ -17,6 +21,7 @@ export class LocalCompanionWebSocketServer {
   private sessionToken: string;
   private activeSenderWs: WebSocket | null = null;
   private activeSenderId: string | null = null;
+  private lastReply = '';
   private port: number;
   private host: string;
   private options: WebSocketServerOptions;
@@ -28,7 +33,7 @@ export class LocalCompanionWebSocketServer {
       maxPayload: 5 * 1024 * 1024, // 5MB limit per spec #22
       ...options,
     };
-    this.sessionToken = crypto.randomBytes(16).toString('hex');
+    this.sessionToken = options.sessionToken || crypto.randomBytes(16).toString('hex');
   }
 
   public getSessionToken(): string {
@@ -41,7 +46,22 @@ export class LocalCompanionWebSocketServer {
       type: 'TOKEN_REFRESHED',
       message: 'Session token has been rotated. Please re-authenticate.',
     });
+    // Drop every existing connection so senders holding the old token lose access
+    if (this.wss) {
+      for (const client of this.wss.clients) {
+        client.close(4001, 'Session token rotated');
+      }
+    }
     return this.sessionToken;
+  }
+
+  // Text typed in the companion's reply box, shown on the active sender's web page
+  public sendReply(text: string): boolean {
+    this.lastReply = text;
+    const ws = this.activeSenderWs;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: 'REPLY_UPDATE', text, timestamp: Date.now() }));
+    return true;
   }
 
   public isSenderConnected(): boolean {
@@ -85,7 +105,7 @@ export class LocalCompanionWebSocketServer {
         });
 
         this.httpServer.listen(this.port, this.host, () => {
-          console.log(`[Local WebSocket Server] Listening strictly on ${this.host}:${this.port}`);
+          console.log(`[Local WebSocket Server] Listening on ${this.host}:${this.port}`);
           console.log(`[Local WebSocket Server] Session Token: ${this.sessionToken}`);
           resolve(this.port);
         });
@@ -99,35 +119,48 @@ export class LocalCompanionWebSocketServer {
     const clientId = crypto.randomUUID();
     let isAuthenticated = false;
 
+    // Spec #11: Only one sender active by default. Only called once the client has authenticated.
+    const assignOrWarn = () => {
+      if (this.activeSenderWs === null || this.activeSenderWs.readyState !== WebSocket.OPEN) {
+        this.activeSenderWs = ws;
+        this.activeSenderId = clientId;
+        ws.send(
+          JSON.stringify({
+            type: 'SENDER_ASSIGNED',
+            isActive: true,
+            message: 'Connected to Desktop Companion service.',
+          })
+        );
+        this.pushLastReply(ws);
+        if (this.options.onSenderStatusChange) {
+          this.options.onSenderStatusChange(true, { id: clientId });
+        }
+      } else {
+        ws.send(
+          JSON.stringify({
+            type: 'WARNING_MULTIPLE_SENDERS',
+            isActive: false,
+            message: 'Another browser session is connected.',
+          })
+        );
+      }
+    };
+
+    const markAuthenticated = () => {
+      if (isAuthenticated) {
+        ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
+        return;
+      }
+      isAuthenticated = true;
+      ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
+      assignOrWarn();
+    };
+
     // Optional query parameter authentication
     const url = new URL(req.url || '', `http://${this.host}:${this.port}`);
     const tokenQuery = url.searchParams.get('token');
     if (tokenQuery && tokenQuery === this.sessionToken) {
-      isAuthenticated = true;
-    }
-
-    // Spec #11: Only one sender active by default
-    if (this.activeSenderWs === null) {
-      this.activeSenderWs = ws;
-      this.activeSenderId = clientId;
-      ws.send(
-        JSON.stringify({
-          type: 'SENDER_ASSIGNED',
-          isActive: true,
-          message: 'Connected to Desktop Companion service.',
-        })
-      );
-      if (this.options.onSenderStatusChange) {
-        this.options.onSenderStatusChange(true, { id: clientId });
-      }
-    } else {
-      ws.send(
-        JSON.stringify({
-          type: 'WARNING_MULTIPLE_SENDERS',
-          isActive: false,
-          message: 'Another browser session is connected.',
-        })
-      );
+      markAuthenticated();
     }
 
     ws.on('message', (data: Buffer | string) => {
@@ -166,9 +199,8 @@ export class LocalCompanionWebSocketServer {
 
         // Authentication handshake
         if (parsed.type === 'AUTH') {
-          if (parsed.token === this.sessionToken) {
-            isAuthenticated = true;
-            ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
+          if (typeof parsed.token === 'string' && parsed.token === this.sessionToken) {
+            markAuthenticated();
           } else {
             ws.send(
               JSON.stringify({
@@ -177,6 +209,67 @@ export class LocalCompanionWebSocketServer {
               })
             );
           }
+          return;
+        }
+
+        // Everything below requires a valid session token (the service is reachable over the LAN)
+        if (!isAuthenticated) {
+          ws.send(
+            JSON.stringify({
+              type: 'AUTH_FAILED',
+              message: 'Session token required. Enter the token shown in the Desktop Companion window.',
+            })
+          );
+          return;
+        }
+
+        // Graceful role takeover: the sender the user is typing in becomes the active one
+        if (parsed.type === 'CLAIM_ACTIVE_SENDER') {
+          const previous = this.activeSenderWs;
+          this.activeSenderWs = ws;
+          this.activeSenderId = clientId;
+          if (previous && previous !== ws && previous.readyState === WebSocket.OPEN) {
+            previous.send(
+              JSON.stringify({
+                type: 'WARNING_MULTIPLE_SENDERS',
+                isActive: false,
+                message: 'Another browser session took over as the active sender.',
+              })
+            );
+          }
+          ws.send(
+            JSON.stringify({
+              type: 'SENDER_ASSIGNED',
+              isActive: true,
+              message: 'Connected to Desktop Companion service.',
+            })
+          );
+          this.pushLastReply(ws);
+          if (this.options.onSenderStatusChange) {
+            this.options.onSenderStatusChange(true, { id: clientId });
+          }
+          return;
+        }
+
+        // Pasted images: sent separately from text so they are not re-sent on every keystroke
+        if (parsed.type === 'IMAGES_UPDATE') {
+          if (this.activeSenderWs !== ws) {
+            ws.send(JSON.stringify({ type: 'ERROR', message: 'Only the active sender may send images.' }));
+            return;
+          }
+          // Untrusted input: accept only base64 raster images (no SVG, which can carry script)
+          const images = Array.isArray(parsed.images)
+            ? parsed.images
+                .filter(
+                  (img: unknown): img is string =>
+                    typeof img === 'string' && /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(img)
+                )
+                .slice(0, MAX_IMAGES)
+            : [];
+          if (this.options.onImagesReceived) {
+            this.options.onImagesReceived(images);
+          }
+          ws.send(JSON.stringify({ type: 'ACK', timestamp: Date.now(), imageCount: images.length }));
           return;
         }
 
@@ -228,6 +321,12 @@ export class LocalCompanionWebSocketServer {
     ws.on('error', (err) => {
       console.error('Client WebSocket socket error:', err);
     });
+  }
+
+  private pushLastReply(ws: WebSocket) {
+    if (this.lastReply && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'REPLY_UPDATE', text: this.lastReply, timestamp: Date.now() }));
+    }
   }
 
   private broadcast(payload: any) {

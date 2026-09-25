@@ -1,6 +1,8 @@
 import { app, BrowserWindow, ipcMain, clipboard, shell } from 'electron';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { LocalCompanionWebSocketServer } from './websocket-server.js';
 import { IPC_CHANNELS, AppPreferences, ConnectionStatusPayload } from './ipc.js';
@@ -8,8 +10,63 @@ import { IPC_CHANNELS, AppPreferences, ConnectionStatusPayload } from './ipc.js'
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Project root: the bundled main runs from electron/out/, the source layout from electron/
+const PROJECT_ROOT = path.resolve(__dirname, path.basename(__dirname) === 'out' ? '../..' : '..');
+
+// Accept senders from other machines on the network by default; set COMPANION_HOST=127.0.0.1 for this machine only
+const WS_HOST = process.env.COMPANION_HOST || '0.0.0.0';
+const WS_PORT = process.env.COMPANION_PORT ? parseInt(process.env.COMPANION_PORT, 10) : 8765;
+
 let mainWindow: BrowserWindow | null = null;
 let wsServer: LocalCompanionWebSocketServer | null = null;
+
+// Session token is persisted so the sender machine does not need a new token after every restart
+const getTokenFilePath = () => path.join(app.getPath('userData'), 'companion-session-token');
+
+function loadOrCreateSessionToken(): string {
+  try {
+    const file = getTokenFilePath();
+    if (fs.existsSync(file)) {
+      const token = fs.readFileSync(file, 'utf8').trim();
+      if (/^[0-9a-f]{32}$/.test(token)) return token;
+    }
+  } catch (err) {
+    console.warn('Failed to read session token:', err);
+  }
+  const token = crypto.randomBytes(16).toString('hex');
+  saveSessionToken(token);
+  return token;
+}
+
+function saveSessionToken(token: string) {
+  try {
+    fs.writeFileSync(getTokenFilePath(), token, 'utf8');
+  } catch (err) {
+    console.error('Failed to save session token:', err);
+  }
+}
+
+// host:port addresses a sender on another machine can use to reach this companion
+function getReachableAddresses(): string[] {
+  if (WS_HOST !== '0.0.0.0') return [`${WS_HOST}:${WS_PORT}`];
+  const addresses: string[] = [];
+  for (const iface of Object.values(os.networkInterfaces())) {
+    for (const info of iface || []) {
+      if (info.family === 'IPv4' && !info.internal) addresses.push(`${info.address}:${WS_PORT}`);
+    }
+  }
+  return addresses;
+}
+
+function buildConnectionStatus(connected: boolean): ConnectionStatusPayload {
+  return {
+    connected,
+    statusText: connected ? 'Connected' : 'Disconnected',
+    port: WS_PORT,
+    sessionToken: wsServer ? wsServer.getSessionToken() : '',
+    addresses: getReachableAddresses(),
+  };
+}
 
 // Preferences storage file (Only store preferences, NEVER received text per spec #13 & #15)
 const getPreferencesFilePath = () => path.join(app.getPath('userData'), 'companion-preferences.json');
@@ -49,6 +106,7 @@ async function createWindow() {
   const prefs = loadStoredPreferences();
 
   mainWindow = new BrowserWindow({
+    alwaysOnTop: !!prefs.alwaysOnTop,
     width: prefs.width || 600,
     height: prefs.height || 500,
     minWidth: 400,
@@ -79,14 +137,27 @@ async function createWindow() {
   });
 
   // Load Companion React UI
-  const isDev = !app.isPackaged;
-  if (isDev) {
-    await mainWindow.loadURL('http://localhost:3000/?mode=companion');
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'), {
+  // In development prefer the Vite dev server; fall back to the built UI in dist/ when it is not
+  // running (e.g. on a machine that only runs the desktop companion).
+  const loadBuiltUI = () =>
+    mainWindow!.loadFile(path.join(PROJECT_ROOT, 'dist', 'index.html'), {
       query: { mode: 'companion' },
     });
+
+  const isDev = !app.isPackaged;
+  if (isDev) {
+    try {
+      await mainWindow.loadURL('http://localhost:3000/?mode=companion');
+    } catch {
+      console.log('Dev server not reachable on localhost:3000, loading built UI from dist/');
+      await loadBuiltUI();
+    }
+    // DevTools are opt-in: set COMPANION_DEVTOOLS=1 to open them on launch
+    if (process.env.COMPANION_DEVTOOLS === '1') {
+      mainWindow.webContents.openDevTools({ mode: 'detach' });
+    }
+  } else {
+    await loadBuiltUI();
   }
 
   mainWindow.on('closed', () => {
@@ -96,13 +167,7 @@ async function createWindow() {
 
 function setupIPC() {
   ipcMain.handle(IPC_CHANNELS.GET_CONNECTION_STATUS, (): ConnectionStatusPayload => {
-    const isConnected = wsServer ? wsServer.isSenderConnected() : false;
-    return {
-      connected: isConnected,
-      statusText: isConnected ? 'Connected' : 'Disconnected',
-      port: 8765,
-      sessionToken: wsServer ? wsServer.getSessionToken() : '',
-    };
+    return buildConnectionStatus(wsServer ? wsServer.isSenderConnected() : false);
   });
 
   ipcMain.handle(IPC_CHANNELS.CLEAR_TEXT, () => {
@@ -112,6 +177,7 @@ function setupIPC() {
         text: '',
         timestamp: Date.now(),
       });
+      mainWindow.webContents.send(IPC_CHANNELS.ON_IMAGES_UPDATE, { images: [] });
     }
   });
 
@@ -130,11 +196,23 @@ function setupIPC() {
   });
 
   ipcMain.handle(IPC_CHANNELS.REGENERATE_SESSION_TOKEN, () => {
-    return wsServer ? wsServer.regenerateSessionToken() : '';
+    if (!wsServer) return '';
+    const token = wsServer.regenerateSessionToken();
+    saveSessionToken(token);
+    return token;
   });
 
   ipcMain.handle(IPC_CHANNELS.SAVE_PREFERENCES, (_event: Electron.IpcMainInvokeEvent, prefs: Partial<AppPreferences>) => {
     saveStoredPreferences(prefs);
+    // Pin button in the companion window: keep it above other windows (it stays in the taskbar)
+    if (typeof prefs.alwaysOnTop === 'boolean' && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setAlwaysOnTop(prefs.alwaysOnTop);
+    }
+  });
+
+  // Reply box in the companion window: text is shown on the connected web sender page
+  ipcMain.handle(IPC_CHANNELS.SEND_REPLY, (_event: Electron.IpcMainInvokeEvent, text: string) => {
+    return wsServer ? wsServer.sendReply(typeof text === 'string' ? text : '') : false;
   });
 
   ipcMain.handle(IPC_CHANNELS.LOAD_PREFERENCES, () => {
@@ -166,10 +244,11 @@ function setupIPC() {
 }
 
 async function init() {
-  // Start Local WebSocket Server on 127.0.0.1:8765
+  // Start the companion WebSocket service (0.0.0.0:8765 by default so another machine can send text)
   wsServer = new LocalCompanionWebSocketServer({
-    port: 8765,
-    host: '127.0.0.1',
+    port: WS_PORT,
+    host: WS_HOST,
+    sessionToken: loadOrCreateSessionToken(),
     onTextReceived: (text, metadata) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send(IPC_CHANNELS.ON_TEXT_UPDATE, {
@@ -178,15 +257,14 @@ async function init() {
         });
       }
     },
+    onImagesReceived: (images) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC_CHANNELS.ON_IMAGES_UPDATE, { images });
+      }
+    },
     onSenderStatusChange: (connected) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        const payload: ConnectionStatusPayload = {
-          connected,
-          statusText: connected ? 'Connected' : 'Disconnected',
-          port: 8765,
-          sessionToken: wsServer?.getSessionToken() || '',
-        };
-        mainWindow.webContents.send(IPC_CHANNELS.ON_CONNECTION_CHANGE, payload);
+        mainWindow.webContents.send(IPC_CHANNELS.ON_CONNECTION_CHANGE, buildConnectionStatus(connected));
       }
     },
     onError: (err) => {
@@ -197,7 +275,7 @@ async function init() {
   try {
     await wsServer.start();
   } catch (err: any) {
-    console.error('Unable to start local communication service. Port 8765 may already be in use.', err);
+    console.error(`Unable to start local communication service. Port ${WS_PORT} may already be in use.`, err);
   }
 
   setupIPC();

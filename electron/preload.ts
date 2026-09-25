@@ -10,10 +10,12 @@ const companionAPI: CompanionIPCBridge = {
       statusText: res.statusText as ConnectionState,
       port: res.port,
       sessionToken: res.sessionToken,
+      addresses: res.addresses || [],
     };
   },
   clearText: () => ipcRenderer.invoke(IPC_CHANNELS.CLEAR_TEXT),
   copyText: (text: string) => ipcRenderer.invoke(IPC_CHANNELS.COPY_TEXT, text),
+  sendReply: (text: string) => ipcRenderer.invoke(IPC_CHANNELS.SEND_REPLY, text),
   getSessionToken: () => ipcRenderer.invoke(IPC_CHANNELS.GET_SESSION_TOKEN),
   regenerateSessionToken: () => ipcRenderer.invoke(IPC_CHANNELS.REGENERATE_SESSION_TOKEN),
   savePreferences: (prefs) => ipcRenderer.invoke(IPC_CHANNELS.SAVE_PREFERENCES, prefs),
@@ -31,6 +33,14 @@ const companionAPI: CompanionIPCBridge = {
     };
   },
 
+  onImagesUpdate: (callback) => {
+    const subscription = (_event: IpcRendererEvent, data: { images: string[] }) => callback(data);
+    ipcRenderer.on(IPC_CHANNELS.ON_IMAGES_UPDATE, subscription);
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.ON_IMAGES_UPDATE, subscription);
+    };
+  },
+
   onConnectionChange: (callback) => {
     const subscription = (_event: IpcRendererEvent, status: ConnectionStatusPayload) => {
       callback({
@@ -38,6 +48,7 @@ const companionAPI: CompanionIPCBridge = {
         statusText: status.statusText as ConnectionState,
         port: status.port,
         sessionToken: status.sessionToken,
+        addresses: status.addresses || [],
       });
     };
     ipcRenderer.on(IPC_CHANNELS.ON_CONNECTION_CHANGE, subscription);

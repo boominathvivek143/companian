@@ -6,3 +6,10 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Build output
+electron/out/
+dist-electron/
+
+# Local tool config
+.claude/
